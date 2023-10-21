@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 import numpy as np
+from keras.datasets import mnist
 np.random.seed(686)
 DIG_A, DIG_B = 4, 9
 SIDE = 28
@@ -9,7 +10,6 @@ MAX_PIX_VAL = 255
 # Prepare dataset
 #############################################################
 
-from keras.datasets import mnist
 # Load the MNIST dataset keeping test set unnamed
 (x_train, y_train), _ = mnist.load_data()
 # x_train = N x SIDE x SIDE array of integers [0, MAX_PIX_VAL] that reveal the pixel intensity
@@ -168,7 +168,6 @@ assert close_enough(f5, np.log(2))
 
 print("Success metric checks passed")
 
-
 #############################################################
 # Linear model - forward model
 #############################################################
@@ -179,6 +178,9 @@ print("Success metric checks passed")
 # Scale weights by SIDE * SIDE: w.dot(x) will be at most on order of +/- sqrt(SIDE * SIDE)
 # scaling this way means decision function values will be at most on order of +/- 1
 linear_init = lambda : np.random.randn(SIDE * SIDE) / np.sqrt(SIDE * SIDE)
+
+def linear_displace(w, coef, g):
+    return w + coef * g
 
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
@@ -295,8 +297,9 @@ def linear_backprop(w, x, y):
 for _ in range(10):
     # Create test variables
     w = linear_init()
-    x = x_train[0]
-    y = y_train[0]
+    idx = np.random.randint(N)
+    x = x_train[idx]
+    y = y_train[idx]
     
     # Check that simplification preserved answer
     g_unsimp    = linear_backprop_unsimp(w, x, y)
@@ -311,6 +314,173 @@ for _ in range(10):
 
 print("Back propagation checks passed")
 
+#############################################################
+# Vanilla neural network model
+#############################################################
+"""
+Any architecture can be used, as long as it is differentiable.
+
+We want a parameterised feature transformation function,
+that we can eventually linearly classify.
+
+A good method is to alternate learned linearities
+with fixed non-linearities.
+
+Leaky ReLU - instead of a slope between 0,1, we have
+a slope between 1/10th and 1 or 1/5th and 1.
+lrelu(z) = max(z/10, z)
+It helps to address vanishing gradient problems.
+
+    x
+    h0 -------> z1 -----> h1 ----> z2 ------> h2 -----> z3 -----> p
+    |                                                          
+    |           |        |                                        
+    |           |        |         |          |                   
+    |   C*      | lrelu  |   B*    |  lrelu   |   A*    | sigmoid |
+    |           |        |         |          |                   
+    |           |        |                    1                                       
+    |                    1 
+    1                                                     
+    D0          D1      D1        D2         D2        D3         1
+    SIDE*SIDE   32                32                   1
+
+In general, we want the dimensions for the first hidden
+layer to be substantially larger, to provide elbow-room to
+learn good high-level features.
+"""
+
+# ~~~~~~ Weight helpers ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+D0 = SIDE * SIDE
+D1 = 32
+D2 = 32
+D3 = 1
+def vanilla_init():
+    A = np.random.randn(    D2) / np.sqrt( 1 + D2)
+    B = np.random.randn(D2, D1) / np.sqrt(D2 + D1)
+    C = np.random.randn(D1, D0) / np.sqrt(D1 + D0)
+    return (A, B, C)
+
+
+
+def vanilla_displace(abc, coef, g):
+    A, B, C     = abc
+    gA, gB, gC  = g
+    return (
+        A + coef * gA,
+        B + coef * gB,
+        C + coef * gC
+    )
+
+
+# ~~~~~~ Forward pass ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+lrelu = lambda z : np.maximum(z/10, z)
+step = lambda z : np.heaviside(z, 0.5)
+dlrelu_dz = lambda z : 0.1 + (1. - 0.1)*step(z)
+
+def vanilla_predict(abc, x):
+    A, B, C = abc
+    #
+    h0 = x.flatten()
+    #
+    z1 = C.dot(h0)
+    h1 = lrelu(z1)
+    #
+    z2 = B.dot(h1)
+    h2 = lrelu(z2)  # learned featurisation
+    #
+    z3 = A.dot(h2)  # linear classifier
+    p = sigmoid(z3)
+    #
+    return p
+
+
+# ~~~~~~ Checks ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+# Initialise weights
+A, B, C = vanilla_init()
+
+# Check that linear layer makes sense
+# Compare same featurisations with +ve and -ve A, holding B and C constant
+sA = success_metrics(lambda x : vanilla_predict((+A, B, C), x), x_train, y_train)["acc"]
+sB = success_metrics(lambda x : vanilla_predict((-A, B, C), x), x_train, y_train)["acc"]
+# Probabilities should sum to 1
+assert close_enough(sA + sB, 1.)
+
+f5 = success_metrics(lambda x : vanilla_predict((0*A, B, C), x), x_train, y_train)["loss"]
+assert close_enough(f5, np.log(2))
+
+# If A, B, C all > 0, that will mean all x's are non-negative
+# so we know the overall output from the network will
+# be positive, since it's very unlikely to be 0.
+
+# Check end-to-end positivity
+x = x_train[0]
+y = y_train[0]
+A = np.abs(A)
+B = np.abs(B)
+C = np.abs(C)
+acc_ppp = success_metrics(lambda x : vanilla_predict((A,  B,  C), x), [x], [DIG_B])["acc"]
+acc_ppn = success_metrics(lambda x : vanilla_predict((A,  B, -C), x), [x], [DIG_B])["acc"]
+acc_pnp = success_metrics(lambda x : vanilla_predict((A, -B,  C), x), [x], [DIG_B])["acc"]
+acc_pnn = success_metrics(lambda x : vanilla_predict((A, -B, -C), x), [x], [DIG_B])["acc"]
+assert close_enough(acc_ppp, 1.)
+assert close_enough(acc_ppn, 0.)
+assert close_enough(acc_pnp, 0.)
+assert close_enough(acc_pnn, 1.)
+
+print("Vanilla neural net checks passed")
+
+# ~~~~~~ Backward pass ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+def vanilla_backprop(abc, x, y):
+    A, B, C = abc
+    #
+    h0 = x.flatten()
+    #
+    z1 = C.dot(h0)
+    h1 = lrelu(z1)
+    #
+    z2 = B.dot(h1)
+    h2 = lrelu(z2)  # learned featurisation
+    #
+    z3 = A.dot(h2)  # linear classifier
+    p = sigmoid(z3)
+    #
+    
+    dl_dz3 = p - (1 if y == DIG_B else 0)
+    dl_dh2 = dl_dz3 * A  # A = dz3_dh2  # scalar * scalar
+    dl_dz2 = dl_dh2 * dlrelu_dz(z2)  # vector * vector
+    dl_dh1 = dl_dz2.dot(B)  # vector * matrix, so dot
+    dl_dz1 = dl_dh1 * dlrelu_dz(z1)  # vector * vector
+    
+    dl_dA = dl_dz3 * h2  # scalar * vector
+    dl_dB = np.outer(dl_dz2, h1)  # to get shapes to match
+    dl_dC = np.outer(dl_dz1, h0)
+    
+    return (dl_dA, dl_dB, dl_dC)
+
+
+#############################################################
+# Sanity checks
+#############################################################
+
+for _ in range(10):
+    # Create test variables
+    abc = vanilla_init()
+    idx = np.random.randint(N)
+    x = x_train[idx]
+    y = y_train[idx]
+    
+    # Do step of gradient descent, check loss decreased
+    before = success_metrics(lambda xx: vanilla_predict(abc, xx), [x], [y])["loss"]
+    g = vanilla_backprop(abc, x, y)
+    abc = vanilla_displace(abc, - 0.01, g)
+    after = success_metrics(lambda xx: vanilla_predict(abc, xx), [x], [y])["loss"]
+    assert after < before
+
+print("Vanilla back propagation checks passed")
 
 #############################################################
 # Training loop
@@ -318,10 +488,11 @@ print("Back propagation checks passed")
 
 # ~~~~~~ Training parameters ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-T = 10001
+# Original values did not converge, so dec LR, 
+T = 15001  # 10001
 DT = 1000
-LEARNING_RATE = 0.1
-ANNEAL_T = 1000
+LEARNING_RATE = 0.01  # 0.1
+ANNEAL_T = 4000  # 1000
 
 idx = 0
 
@@ -333,19 +504,39 @@ def next_training_example():
     return xy   
 
 
-# ~~~~~~ SGD - THE ENGINE OF LEARNING ~~~~~~~~~~~~~~~~~~~~~~~
+# ~~~~~~ Interface with model ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+# INIT, BACK, DISP, PRED = (
+#     (linear_init, linear_backprop, linear_displace, linear_predict)
+# )
+
+INIT, BACK, DISP, PRED = (
+    (vanilla_init, vanilla_backprop, vanilla_displace, vanilla_predict)
+)
+
+# ~~~~~~ SGD - ENGINE of machine learning ~~~~~~~~~~~~~~~~~~~
 
 # Initialise w
-w = linear_init()
+w = INIT()
+# Add momentum for physics simulation, so that instead of displacing
+# by the gradient, we displace by momentum
+# the gradient will then affect things by changing momentum
+m = DISP(w, -1., w)  # hacky way to set m = 0 of same shape as w
+# the momentum will accumulate gradients, so each update made
+# is the "average wisdom" of a group of previous gradients
+# momentum makes SGD less prone to becoming stuck in a local
+# minima due to the presence of a minor bump in the road
 
 for t in range(T):
     x, y = next_training_example()
-    g = linear_backprop(w, x, y)
+    g = BACK(w, x, y)
     LR = LEARNING_RATE * float(ANNEAL_T) / (ANNEAL_T + t)
-    w = w - LR * g
+    m = DISP(m, -0.1, m)  # m forgets a bit of its past ... .1 is drag coef
+    m = DISP(m, +1., g)  # add gradient to momentum
+    w = DISP(w, -LR, m)  # update based on momentum
     
     if t % DT : continue
     
-    ms = success_metrics(lambda x: linear_predict(w, x), x_train, y_train)
+    ms = success_metrics(lambda x: PRED(w, x), x_train, y_train)
     print(f"at step {t:6d}; tr acc {ms['acc']:4.2f}; tr loss {ms['loss']:5.3f}")
     
