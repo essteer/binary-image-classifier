@@ -462,9 +462,7 @@ def vanilla_backprop(abc, x, y):
     return (dl_dA, dl_dB, dl_dC)
 
 
-#############################################################
-# Sanity checks
-#############################################################
+# ~~~~~~ Checks ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 for _ in range(10):
     # Create test variables
@@ -481,6 +479,244 @@ for _ in range(10):
     assert after < before
 
 print("Vanilla back propagation checks passed")
+
+#############################################################
+# Convoluted neural network model
+#############################################################
+"""
+Any architecture can be used, as long as it is differentiable.
+
+In this model we de-emphasise pooling.
+
+In the chart below, we transform inputs (top) to outputs (bottom).
+
+                    height x width x channels
+    x                   28 x 28 x 1
+        avgpool                                     2x2
+    h0                  14 x 14 x 1
+        conv                            weight C    5x5x8x1 stride 2x2
+    z1                   5 x  5 x 8
+        lrelu
+    h1                   5 x  5 x 8   
+        conv                            weight B    5x5x8x1 stride 1x1
+    z2                   5 x  5 x 4
+        lrelu
+    h2                   5 x  5 x 4
+        dense                           weight A    1x(5*5*4)
+    z3                            1
+        sigmoid
+    p                             1          
+
+If we wanted to add bias to the h1 layer, for example,
+we could set the dimensions to 5x5x9, since this would
+add one further 5x5 layer.
+
+1x1 convolution has become more popular in recent years.
+These still have an effect, but do so without 
+reference to their neighbour; each location only relates
+to its corresponding location.
+"""
+
+# ~~~~~~ Weights helpers ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+def conv_init():
+    A = np.random.randn(5 * 5 * 4) / np.sqrt(1 + 5 * 5 * 4)
+    B = np.random.randn(1, 1, 4, 8) / np.sqrt(4 + 1 * 1 * 8)
+    C = np.random.randn(5, 5, 8, 1) / np.sqrt(8 + 5 * 5 * 1)
+    return (A, B, C)
+
+
+def conv_displace(abc, coef, g):
+    A, B, C     = abc
+    gA, gB, gC  = g
+    return (
+        A + coef * gA,
+        B + coef * gB,
+        C + coef * gC
+    )
+
+# ~~~~~~ Building blocks ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+def avgpool2x2(x):
+    H, W, C = x.shape  # height, width, channel
+    # return an array of shape (H/2 x W/2 x C)
+    # if doing this for more complex pools we can
+    # use np.transpose instead of this manual version
+    return (  x[0:H:2, 0:W:2]
+            + x[0:H:2, 1:W:2]
+            + x[1:H:2, 0:W:2]
+            + x[1:H:2, 1:W:2])/4.
+    
+
+def conv(x, weights, stride=1):
+    H, W, C = x.shape  # height, width, channel
+    KH, KW, OD, ID = weights.shape  # kernel / output / input
+    assert C == ID
+    HH, WW = int((H - KH + 1)/stride), int((W - KW + 1)/stride)
+    # return an array of shape HH x WW x OD
+    return np.array(
+        [[
+            np.tensordot(
+                weights,                     # KH x WH x OD x ID
+                x[h:h+KH, w:w+KW],           # KH x KW      x ID
+                ((0, 1, 3), (0, 1, 2))
+        )
+             for w in range(0, WW*stride, stride)]
+         for h in range(0, HH*stride, stride)]
+        )
+    
+
+# ~~~~~~ Checks for forward ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+# Scaling and shape tests
+aa = np.ones((8, 12, 7))  # test with factors of diff. primes (2, 3, 7)
+pp = np.ones((4, 6, 7))
+assert close_enough(avgpool2x2(aa), pp)
+
+ww = np.ones((3, 3, 5, 7))
+cc = (3*3*7)*np.ones((6, 10, 5))
+assert close_enough(conv(aa, ww, stride=1), cc)
+
+# Orientation test
+bb = np.array([1*np.eye(4), 3*np.eye(4)])  # 2 x 4 x 4
+"""
+bb == [
+    [[1, 0, 0, 0], [0, 1, 0, 0], [0, 0, 1, 0], [0, 0, 0, 1]], 
+    [[3, 0, 0, 0], [0, 3, 0, 0], [0, 0, 3, 0], [0, 0, 0, 3]]
+    ]
+"""
+pp = np.array([[[1, 1, 0, 0], [0, 0, 1, 1]]])
+assert close_enough(avgpool2x2(bb), pp)
+
+ww = np.zeros((2, 2, 1, 4))
+ww[0, 0, :, :] = 1 + np.arange(4)
+cc = np.array([1, 2, 3])[np.newaxis, :, np.newaxis]  # shape 1 x 3 x 1
+assert close_enough(conv(bb, ww, stride=1), cc)
+
+print("Conv neural net checks passed")
+
+# ~~~~~~ Derivatives ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+"""
+Why do we want dconv(x, w)/dw? 
+So that we can compute dl/dw from dl/dconv(x, w).
+This can be simplified by writing a function that
+directly gives dl/dw from dl/dconv(x, w).
+"""
+def Dw_conv(x, weights_shape, dl_dconv, stride=1):
+    H, W, C = x.shape  # height, width, channel
+    KH, KW, OD, ID = weights_shape  # kernel / output / input
+    assert C == ID
+   
+    HH, WW = int((H - KH + 1)/stride), int((W - KW + 1)/stride)
+    assert dl_dconv.shape == (HH, WW, OD)
+    
+    # return an array of shape KH x KW x OD x ID
+    HS, WS = HH*stride, WW*stride
+    dl_dw = np.array(
+        [[np.tensordot(
+            dl_dconv,                                # HH x WW x OD
+            x[dh:dh+HS:stride, dw:dw+WS:stride],     # HH x WW x ID
+            ((0, 1), (0, 1))
+        )
+            for dw in range(KW)] 
+         for dh in range(KH)]
+    )
+    
+    return dl_dw
+
+
+"""
+Why do we want dconv(x, w)/dx? 
+So that we can compute dl/dx from dl/dconv(x, w).
+This can be simplified by writing a function that
+directly gives dl/dx from dl/dconv(x, w).
+"""
+def Dx_conv(x_shape, weights, dl_dconv, stride):
+    H, W, C = x_shape  # height, width, channel
+    KH, KW, OD, ID = weights.shape  # kernel / output / input
+    assert C == ID
+   
+    HH, WW = int((H - KH + 1)/stride), int((W - KW + 1)/stride)
+    assert dl_dconv.shape == (HH, WW, OD)
+    
+    # return H x W x ID
+    dl_dx = np.zeros((H, W, ID), dtype=np.float32)
+    for h in range(KH):
+        for w in range(KW):
+            dl_dx[h:h+HH*stride:stride, w:w+WW*stride:stride] += (
+                np.tensordot(dl_dconv,          # HH x WW x OD
+                             weights[h, w],      # OD x ID
+                             ((2,), (0,))
+                              )
+            )
+    
+    return dl_dx
+
+
+# ~~~~~~ Forward pass ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+"""
+                    height x width x channels
+    x                   28 x 28 x 1
+        avgpool                                     2x2
+    h0                  14 x 14 x 1
+        conv                            weight C    5x5x8x1 stride 2x2
+    z1                   5 x  5 x 8
+        lrelu
+    h1                   5 x  5 x 8   
+        conv                            weight B    5x5x8x1 stride 1x1
+    z2                   5 x  5 x 4
+        lrelu
+    h2                   5 x  5 x 4
+        dense                           weight A    1x(5*5*4)
+    z3                            1
+        sigmoid
+    p                             1          
+
+"""
+def conv_predict(abc, x):
+    A, B, C = abc
+    
+    h0 = avgpool2x2(x[:, :, np.newaxis])
+    
+    z1 = conv(h0, C, stride=2)
+    h1 = lrelu(z1)
+    
+    z2 = conv(h1, B, stride=1)
+    h2 = lrelu(z2)
+    
+    z3 = A.dot(h2.flatten())
+    p = sigmoid(z3)
+    
+    return p
+
+
+# ~~~~~~ Backward pass ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+def conv_backprop(abc, x, y):
+    A, B, C = abc
+    
+    h0 = avgpool2x2(x[:, :, np.newaxis])
+    
+    z1 = conv(h0, C, stride=2)
+    h1 = lrelu(z1)
+    
+    z2 = conv(h1, B, stride=1)
+    h2 = lrelu(z2)
+    
+    z3 = A.dot(h2.flatten())
+    p = sigmoid(z3)
+    
+    dl_dz3 = p - (1 if y == DIG_B else 0)
+    dl_dh2 = dl_dz3 * A.reshape(h2.shape)
+    dl_dz2 = dl_dh2 * dlrelu_dz(z2)
+    dl_dh1 = Dx_conv(h1.shape, B, dl_dz2, stride=1)
+    dl_dz1 = dl_dh1 * dlrelu_dz(z1)
+    
+    dl_dA = dl_dz3 * h2.flatten()
+    dl_dB = Dw_conv(h1, B.shape, dl_dz2, stride=1)
+    dl_dC = Dw_conv(h0, C.shape, dl_dz1, stride=2)
+    
+    return (dl_dA, dl_dB, dl_dC)
 
 #############################################################
 # Training loop
@@ -510,8 +746,12 @@ def next_training_example():
 #     (linear_init, linear_backprop, linear_displace, linear_predict)
 # )
 
+# INIT, BACK, DISP, PRED = (
+#     (vanilla_init, vanilla_backprop, vanilla_displace, vanilla_predict)
+# )
+
 INIT, BACK, DISP, PRED = (
-    (vanilla_init, vanilla_backprop, vanilla_displace, vanilla_predict)
+    (conv_init, conv_backprop, conv_displace, conv_predict)
 )
 
 # ~~~~~~ SGD - ENGINE of machine learning ~~~~~~~~~~~~~~~~~~~
