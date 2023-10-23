@@ -1,69 +1,108 @@
 # -*- coding: utf-8 -*-
 import numpy as np
 from keras.datasets import mnist
+import tqdm
 np.random.seed(686)
 DIG_A, DIG_B = 4, 9
 SIDE = 28
 MAX_PIX_VAL = 255
+NB_TRAIN = 1000
 
+#~~~~~ Notes ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+"""
+This model has:
+-- no bias trick
+-- no model selection
+-- no feature engineering
+-- no pooling
+
+It does have:
+-- stride
+-- momentum
+"""
 #############################################################
 # Prepare dataset
 #############################################################
 
 # Load the MNIST dataset keeping test set unnamed
-(x_train, y_train), _ = mnist.load_data()
+(x_train, y_train), (x_test, y_test) = mnist.load_data()
 # x_train = N x SIDE x SIDE array of integers [0, MAX_PIX_VAL] that reveal the pixel intensity
 # y_train = N array of integers [1, 10]
 # N = 60,000
 
-#############################################################
+#~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 # Keep only DIG_As and DIG_Bs for this binary classification
-#############################################################
+#~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
  
-# Return boolean array the same shape as y_train,
-# with True for elements equal to DIG_A or DIG_B, False otherwise
-indices = np.logical_or(
-    np.equal(y_train, DIG_A), 
-    np.equal(y_train, DIG_B)
-    )
-# Update x_train and y_train to remove all elements marked False in indices
-x_train = x_train[indices]
-y_train = y_train[indices]
-# x_train = N x SIDE x SIDE array of integers [0, MAX_PIX_VAL] that reveal the pixel intensity
+def filter_digits(xs, ys):
+    """
+    Return boolean array the same shape as y_train,
+    with True for elements equal to DIG_A or DIG_B, 
+    False otherwise
+    """
+    indices = np.logical_or(
+        np.equal(ys, DIG_A), 
+        np.equal(ys, DIG_B)
+        )
+    # Update x_train and y_train 
+    # to remove all elements marked False in indices
+    xs = xs[indices]
+    ys = ys[indices]
+    
+    return xs, ys
+
+
+x_train, y_train = filter_digits(x_train, y_train)
+x_test, y_test = filter_digits(x_test, y_test)
+# x_train = N x SIDE x SIDE array of integers [0, MAX_PIX_VAL] 
+# that reveal the pixel intensity
 # y_train = N array of integers {DIG_A, DIG_B}
 # N ~ 12,000
 
-
-#############################################################
-# Shape
-#############################################################
-
-assert len(x_train) == len(y_train)
-N = len(x_train)
-
-#############################################################
+#~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 # Normalise pixel intensities
-#############################################################
+#~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 x_train = x_train / float(MAX_PIX_VAL)
+x_test = x_test / float(MAX_PIX_VAL)
 # x_train = N x SIDE x SIDE array of floats [0., 1.] that reveal the pixel intensity
 # y_train = N array of integers {DIG_A, DIG_B}
 # N ~ 12,000
 
-#############################################################
+#~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 # Shuffle data
-#############################################################
+#~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-# Shuffle x_train and y_train in the same way,
-# so that corresponding pairs remain intact
-indices = np.arange(N)
-np.random.shuffle(indices)  # mutating shuffle
-# Apply the shuffled indices to x_train and y_train
-x_train = x_train[indices]  # indices now an int array, not a boolean array
-y_train = y_train[indices]
-# For the new x_train and y_train, 
-# the (e.g.) 42nd element is the kth element of the former x_train and y_train
-# where k == the 42nd element of indices
+def shuffle(xs, ys):
+    """
+    Shuffle x_train (x_test) and y_train (y_test) in the same way,
+    so that corresponding pairs remain intact
+    For the new xs and ys, the (e.g.) 42nd element is the kth 
+    element of the former xs and ys where k == the 42nd element of indices
+    """
+    indices = np.arange(len(xs))
+    np.random.shuffle(indices)  # mutating shuffle
+    # Apply the shuffled indices to x_train and y_train
+    xs = xs[indices]  # indices now an int array, not a boolean array
+    ys = ys[indices]
+    
+    return xs, ys
+
+
+x_train, y_train = shuffle(x_train, y_train)
+x_test, y_test = shuffle(x_test, y_test)
+
+#~~~~~~ Pare down training set ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+x_train = x_train[:NB_TRAIN]
+y_train = y_train[:NB_TRAIN]
+
+#~~~~~~ Add intensity noise ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+x_train = x_train + np.random.randn(*x_train.shape)
+x_train = np.maximum(0., np.minimum(1., x_train))
+
+#~~~~~~ Shape ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+assert len(x_train) == len(y_train)
+N = len(x_train)
 
 #############################################################
 # Sanity checks
@@ -78,7 +117,7 @@ assert y_train.shape == (N,)
 assert set(y_train) == {DIG_A, DIG_B}
 assert close_enough(np.min(x_train), 0.)
 assert close_enough(np.max(x_train), 1.)
-assert abs(N - 12000) < 500
+assert abs(N - min(NB_TRAIN, 12000)) < 500
 
 print(f"Prepared {N:,} training examples")
 
@@ -113,7 +152,10 @@ def cross_entropy_loss(predicted_probs, true_ys):
              for p, y in zip(predicted_probs, true_ys)])
 
 
-def success_metrics(predictor, xs, ys):
+def success_metrics(predictor, xs, ys, verbose=False):
+    # Progress bar
+    xs = tqdm.tqdm(xs) if verbose else xs
+    
     probs = [predictor(x) for x in xs]
     labels = [DIG_B if p > 0.5 else DIG_A for p in probs]
     acc = accuracy(labels, ys)
@@ -729,54 +771,78 @@ T = 15001  # 10001
 DT = 1000
 LEARNING_RATE = 0.01  # 0.1
 ANNEAL_T = 4000  # 1000
+DRAG_COEF = 0.1
 
 idx = 0
 
 def next_training_example():
-    global idx
+    global idx, x_train, y_train
     xy = x_train[idx], y_train[idx]
     idx += 1
-    idx %= N  # if idx == N, set to 0 so as to loop
+    
+    if idx == N:
+        idx = 0
+        x_train, y_train = shuffle(x_train, y_train)
     return xy   
 
 
 # ~~~~~~ Interface with model ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-# INIT, BACK, DISP, PRED = (
-#     (linear_init, linear_backprop, linear_displace, linear_predict)
-# )
-
-# INIT, BACK, DISP, PRED = (
-#     (vanilla_init, vanilla_backprop, vanilla_displace, vanilla_predict)
-# )
-
-INIT, BACK, DISP, PRED = (
-    (conv_init, conv_backprop, conv_displace, conv_predict)
-)
+FUNCS_BY_MODEL = {
+    "linear": (linear_init, linear_backprop, linear_displace, linear_predict),
+    "vanilla": (vanilla_init, vanilla_backprop, vanilla_displace, vanilla_predict),
+    "conv": (conv_init, conv_backprop, conv_displace, conv_predict)
+}#
 
 # ~~~~~~ SGD - ENGINE of machine learning ~~~~~~~~~~~~~~~~~~~
 
-# Initialise w
-w = INIT()
-# Add momentum for physics simulation, so that instead of displacing
-# by the gradient, we displace by momentum
-# the gradient will then affect things by changing momentum
-m = DISP(w, -1., w)  # hacky way to set m = 0 of same shape as w
-# the momentum will accumulate gradients, so each update made
-# is the "average wisdom" of a group of previous gradients
-# momentum makes SGD less prone to becoming stuck in a local
-# minima due to the presence of a minor bump in the road
-
-for t in range(T):
-    x, y = next_training_example()
-    g = BACK(w, x, y)
-    LR = LEARNING_RATE * float(ANNEAL_T) / (ANNEAL_T + t)
-    m = DISP(m, -0.1, m)  # m forgets a bit of its past ... .1 is drag coef
-    m = DISP(m, +1., g)  # add gradient to momentum
-    w = DISP(w, -LR, m)  # update based on momentum
+for MODEL in ("linear", "vanilla", "conv"):
     
-    if t % DT : continue
+    print("\n"*4)
+    print(MODEL)
+    print("\n"*2)
+    INIT, BACK, DISP, PRED = FUNCS_BY_MODEL[MODEL]
     
-    ms = success_metrics(lambda x: PRED(w, x), x_train, y_train)
-    print(f"at step {t:6d}; tr acc {ms['acc']:4.2f}; tr loss {ms['loss']:5.3f}")
+    # Initialise w
+    w = INIT()
+    # Add momentum for physics simulation, so that instead of displacing
+    # by the gradient, we displace by momentum
+    # the gradient will then affect things by changing momentum
+    m = DISP(w, -1., w)  # hacky way to set m = 0 of same shape as w
+    # the momentum will accumulate gradients, so each update made
+    # is the "average wisdom" of a group of previous gradients
+    # momentum makes SGD less prone to becoming stuck in a local
+    # minima due to the presence of a minor bump in the road
     
+    for t in range(T):
+        x, y = next_training_example()
+        g = BACK(w, x, y)
+        LR = LEARNING_RATE * float(ANNEAL_T) / (ANNEAL_T + t)
+        m = DISP(m, -DRAG_COEF, m)  # m forgets a bit of its past
+        m = DISP(m, +1., g)  # add gradient to momentum
+        w = DISP(w, -LR, m)  # update based on momentum
+        
+        if t % DT : continue
+        
+        xs = x_train[-1000:]
+        ys = y_train[-1000:]
+        ms_train = success_metrics(lambda x: PRED(w, x), xs, ys)
+        
+        xs = x_test[-1000:]
+        ys = y_test[-1000:]
+        ms_test = success_metrics(lambda x: PRED(w, x), xs, ys)
+        
+        print(f"at step {t:6d}; tr acc {ms_train['acc']:4.2f}; tr loss {ms_train['loss']:5.3f}; te acc {ms_test['acc']:4.2f}; te loss {ms_test['loss']:5.3f}")
+        
+    
+    xs = x_train[:]
+    ys = y_train[:]
+    ms_train = success_metrics(lambda x: PRED(w, x), xs, ys, verbose=True)
+    
+    xs = x_test[:]
+    ys = y_test[:]
+    ms_test = success_metrics(lambda x: PRED(w, x), xs, ys, verbose=True)
+    
+    print("After all training")
+    print(f"at step {t:6d}; tr acc {ms_train['acc']:4.2f}; tr loss {ms_train['loss']:5.3f}; te acc {ms_test['acc']:4.2f}; te loss {ms_test['loss']:5.3f}")
+        
